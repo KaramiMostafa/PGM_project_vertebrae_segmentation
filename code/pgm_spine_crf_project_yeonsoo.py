@@ -635,54 +635,119 @@ def apply_densecrf(image_gray01: np.ndarray,
     prob_fg01:   HxW float in [0,1] (foreground probability)
     Returns refined prob_fg01 after DenseCRF mean-field iterations.
     """
-    # Try to use pydensecrf; otherwise fall back to bilateral approximation
+    # How strongly to trust DenseCRF vs. original unaries
+    # alpha = 1.0 -> pure CRF, alpha = 0.0 -> pure U-Net
+    alpha = 0.5
+
     try:
         import pydensecrf.densecrf as dcrf
-        from pydensecrf.utils import unary_from_softmax, create_pairwise_bilateral, create_pairwise_gaussian
+        from pydensecrf.utils import (
+            unary_from_softmax,
+            create_pairwise_bilateral,
+            create_pairwise_gaussian,
+        )
+
         H, W = image_gray01.shape
-        # softmax over classes: background, foreground
-        soft = np.stack([1.0 - prob_fg01, prob_fg01], axis=0)
-        unary = unary_from_softmax(soft)
+
+        # Softmax over classes: background, foreground
+        soft = np.stack([1.0 - prob_fg01, prob_fg01], axis=0).astype(np.float32)  # (2,H,W)
+        unary = unary_from_softmax(soft)  # (2, H*W) negative log-probs
+
         d = dcrf.DenseCRF2D(W, H, 2)
         d.setUnaryEnergy(unary)
-        feats_gauss = create_pairwise_gaussian(sdims=(sxy_gaussian, sxy_gaussian), shape=(H, W))
-        d.addPairwiseEnergy(feats_gauss, compat=compat_gaussian, kernel=dcrf.DIAG_KERNEL,
-                            normalization=dcrf.NORMALIZE_SYMMETRIC)
-        # Need 3-channel image for bilateral term
+
+        # Spatial (Gaussian) term
+        feats_gauss = create_pairwise_gaussian(
+            sdims=(sxy_gaussian, sxy_gaussian),
+            shape=(H, W),
+        )
+        d.addPairwiseEnergy(
+            feats_gauss,
+            compat=compat_gaussian,
+            kernel=dcrf.DIAG_KERNEL,
+            normalization=dcrf.NORMALIZE_SYMMETRIC,
+        )
+
+        # Bilateral term needs a 3-channel guidance image
         if image_gray01.ndim == 2:
             if _HAS_CV2:
-                img_rgb = cv2.cvtColor((image_gray01 * 255).astype(np.uint8), cv2.COLOR_GRAY2RGB)
+                img_rgb = cv2.cvtColor(
+                    (image_gray01 * 255).astype(np.uint8),
+                    cv2.COLOR_GRAY2RGB,
+                )
             else:
-                img_rgb = np.repeat((image_gray01 * 255).astype(np.uint8)[..., None], 3, axis=2)
+                img_rgb = np.repeat(
+                    (image_gray01 * 255).astype(np.uint8)[..., None],
+                    3,
+                    axis=2,
+                )
         else:
             img_rgb = (image_gray01 * 255).astype(np.uint8)
-        feats_bi = create_pairwise_bilateral(sdims=(sxy_bilateral, sxy_bilateral),
-                                             schan=(srgb_bilateral, srgb_bilateral, srgb_bilateral),
-                                             img=img_rgb, chdim=2)
-        d.addPairwiseEnergy(feats_bi, compat=compat_bilateral, kernel=dcrf.DIAG_KERNEL,
-                            normalization=dcrf.NORMALIZE_SYMMETRIC)
-        Q = d.inference(n_iters)
-        refined = np.array(Q)[1, :].reshape((H, W))
+
+        feats_bi = create_pairwise_bilateral(
+            sdims=(sxy_bilateral, sxy_bilateral),
+            schan=(srgb_bilateral, srgb_bilateral, srgb_bilateral),
+            img=img_rgb,
+            chdim=2,
+        )
+        d.addPairwiseEnergy(
+            feats_bi,
+            compat=compat_bilateral,
+            kernel=dcrf.DIAG_KERNEL,
+            normalization=dcrf.NORMALIZE_SYMMETRIC,
+        )
+
+        # Mean-field inference
+        iters = int(max(1, n_iters))
+        Q = d.inference(iters)  # list-of-arrays length K, each (H*W,)
+        Q = np.asarray(Q, dtype=np.float32).reshape(2, H, W)
+
+        # Foreground marginal from CRF
+        crf_fg = Q[1]
+
+        # Blend CRF output with original probability to avoid total collapse
+        refined = alpha * crf_fg + (1.0 - alpha) * prob_fg01
+        refined = np.clip(refined, 0.0, 1.0)
         return refined.astype(np.float32)
-    except Exception as e:
-        # Fallback: edge-aware bilateral filtering + sharpening
+
+    except Exception:
+        # Fallback: approximate mean-field with repeated bilateral filtering + edge sharpening
         H, W = image_gray01.shape
+        n = int(max(1, n_iters))
+
         if _HAS_CV2:
-            # bilateral filter the probability map guided by the image edges
-            prob = prob_fg01.astype(np.float32)
-            # cv2 bilateral filter expects 8-bit or float32; we'll rescale
-            prob_bi = cv2.bilateralFilter(prob, d=7, sigmaColor=srgb_bilateral, sigmaSpace=sxy_bilateral)
-            # light sharpening towards edges
-            if _HAS_CV2:
-                edges = cv2.Canny((image_gray01 * 255).astype(np.uint8), 50, 150).astype(np.float32) / 255.0
-                prob_ref = np.clip(prob_bi + 0.2 * edges, 0.0, 1.0)
-            else:
-                prob_ref = prob_bi
-            return prob_ref.astype(np.float32)
+            cur = prob_fg01.astype(np.float32)
+
+            # Precompute an edge map once
+            edges = cv2.Canny(
+                (image_gray01 * 255).astype(np.uint8),
+                50,
+                150,
+            ).astype(np.float32) / 255.0
+
+            for _ in range(n):
+                # Edge-aware smoothing
+                cur = cv2.bilateralFilter(
+                    cur,
+                    d=7,
+                    sigmaColor=srgb_bilateral,
+                    sigmaSpace=sxy_bilateral,
+                )
+                # Mild sharpening towards edges
+                cur = np.clip(cur + 0.2 * edges, 0.0, 1.0)
+
+            # Blend with original prob map as well
+            refined = alpha * cur + (1.0 - alpha) * prob_fg01
+            return refined.astype(np.float32)
+
         else:
-            # Minimal fallback: Gaussian blur (no edges)
+            # Minimal fallback without OpenCV: repeated Gaussian blur
             from scipy.ndimage import gaussian_filter
-            return gaussian_filter(prob_fg01, sigma=1.0).astype(np.float32)
+            cur = prob_fg01.astype(np.float32)
+            for _ in range(n):
+                cur = gaussian_filter(cur, sigma=sxy_gaussian)
+            refined = alpha * cur + (1.0 - alpha) * prob_fg01
+            return refined.astype(np.float32)
 
 
 # --------------------------------------------------------------------------------------
@@ -1094,78 +1159,128 @@ def _evaluate_crfrnn(loader: DataLoader, ckpt_path: str, base: int, device: torc
 def crf_iteration_sweep(args):
     """
     Perform an iteration sweep for both DenseCRF post‐processing and
-    CRF‐as‐RNN.  For each iteration count from 1 up to args.iter_max, the
-    segmentation performance is computed on the validation split.  This
-    facilitates analysis of how the number of mean‐field iterations
-    influences convergence and accuracy.
+    CRF‐as‐RNN. For each iteration count from 1 up to args.iter_max, the
+    segmentation performance is computed on the validation split.
     """
+
+    import json
+
     set_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
     data_root = args.data_root
-    proc_dir = os.path.join(data_root, "Original")
+
+    # Use the same Processed/ images as other modes
+    proc_dir = os.path.join(data_root, "Processed")
     files_all = list_images(proc_dir)
     assert len(files_all) > 0, "No images found under Processed/"
-    # Use the same train/val/test split as other modes
+
+    # Train/val/test split consistent with the rest of the code
     _, val_list, _ = split_train_val_test(files_all, seed=args.seed)
-    val_ds = SpineProcessedDataset(data_root, val_list, size=(args.size, args.size), augment=False)
+
+    # Dataset built on Processed/ paths
+    val_ds = SpineProcessedDataset(
+        data_root,
+        val_list,
+        size=(args.size, args.size),
+        augment=False
+    )
+
     # For DenseCRF evaluation we need batch_size=1
     val_loader_dense = DataLoader(val_ds, batch_size=1, shuffle=False)
     # For CRF-RNN evaluation we can use larger batch sizes
     val_loader_crf = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    # Load U-Net for DenseCRF; if args.ckpt points to a U-Net model we use it
+
+    # Checkpoint is required
     assert args.ckpt is not None and os.path.isfile(args.ckpt), "Provide --ckpt for the trained model"
-    # Determine whether checkpoint is for CRF-RNN or plain U-Net by inspecting parameter keys
+
+    # Load checkpoint once
     state = torch.load(args.ckpt, map_location=device)
-    # In both cases we need a U-Net backbone for DenseCRF; for CRF-RNN checkpoints the backbone weights
-    # are compatible because UNetWithCRF uses the same U-Net architecture for logits
-    # Build a plain U-Net and load whatever keys match
+
+    # ------------------------------------------------------------------
+    # 1) DenseCRF sweep (use plain U-Net backbone)
+    # ------------------------------------------------------------------
     unet = UNet(in_ch=1, out_ch=2, base=args.base).to(device)
-    # Load weights that are present in checkpoint
-    missing, unexpected = unet.load_state_dict(state["model"], strict=False)
-    if len(missing) > 0:
-        # It's possible that ckpt corresponds to CRF-RNN; ignore missing keys for CRF
-        pass
+    # Allow missing keys in case this ckpt comes from CRF-RNN
+    unet.load_state_dict(state["model"], strict=False)
     unet.to(device)
-    # Iterate over iteration counts
+    unet.eval()
+
     print("[Sweep] Iterations vs. metrics (DenseCRF)")
     dense_results = {}
     for it in range(1, args.iter_max + 1):
-        metrics = _evaluate_densecrf(
-            loader=val_loader_dense,
-            unet=unet,
-            device=device,
-            n_iters=it,
-            sxy_gauss=args.sxy_gauss,
-            compat_gauss=args.compat_gauss,
-            sxy_bi=args.sxy_bi,
-            srgb_bi=args.srgb_bi,
-            compat_bi=args.compat_bi,
-        )
-        dense_results[it] = metrics
-        print(f"  DenseCRF it={it}: {metrics}")
+        # Inline evaluation for DenseCRF with n_iters = it
+        agg = {"dice": [], "iou": [], "precision": [], "recall": [],
+               "hd95": [], "assd": [], "bf1": []}
+        with torch.no_grad():
+            for batch in val_loader_dense:
+                img = batch["image"].to(device)          # (1,1,H,W) normalized
+                msk = batch["mask"].numpy()[0,0].astype(np.uint8)
+                # U-Net probs
+                logits = unet(img)                       # (1,2,H,W)
+                prob = torch.softmax(logits, dim=1)[:,1:2,:,:].cpu().numpy()[0,0]
+
+                # Guidance image in [0,1]
+                img_np = img.cpu().numpy()[0,0]
+                img_01 = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-6)
+
+                # DenseCRF with it iterations
+                p_ref = apply_densecrf(
+                    image_gray01=img_01,
+                    prob_fg01=prob,
+                    n_iters=it,
+                    sxy_gaussian=args.sxy_gauss,
+                    compat_gaussian=args.compat_gauss,
+                    sxy_bilateral=args.sxy_bi,
+                    srgb_bilateral=args.srgb_bi,
+                    compat_bilateral=args.compat_bi,
+                )
+                pred_mask = (p_ref >= 0.5).astype(np.uint8)
+
+                metrics = compute_metrics(pred_mask, msk)
+                for k, v in metrics.items():
+                    agg[k].append(v)
+
+        dense_metrics = {k: float(np.mean(v)) for k, v in agg.items()}
+        dense_results[it] = dense_metrics
+        print(f"  DenseCRF it={it}: {dense_metrics}")
+
+    # ------------------------------------------------------------------
+    # 2) CRF-as-RNN sweep (rebuild model with different n_iters)
+    # ------------------------------------------------------------------
     print("\n[Sweep] Iterations vs. metrics (CRF-as-RNN)")
     crf_results = {}
+
     for it in range(1, args.iter_max + 1):
-        metrics = _evaluate_crfrnn(
-            loader=val_loader_crf,
-            ckpt_path=args.ckpt,
-            base=args.base,
-            device=device,
-            n_iters=it,
+        print(f"  [CRF-RNN] Evaluating with n_iters={it}")
+
+        # Build a fresh CRF-RNN model with this iteration count
+        model = UNetWithCRF(in_ch=1, base=args.base, n_iters=it).to(device)
+        # Load trained weights; allow missing/unexpected keys so both
+        # U-Net-only and CRF-RNN checkpoints don't crash.
+        model.load_state_dict(state["model"], strict=False)
+        model.to(device)
+
+        # Evaluate on val set
+        metrics_val = evaluate_model(
+            model,
+            val_loader_crf,
+            device,
+            out_dir=None,          # or os.path.join(args.out_dir, f"pred_val_crfrnn_it{it}")
+            use_softmax_2c=True    # model outputs 2-class logits
         )
-        crf_results[it] = metrics
-        print(f"  CRF-RNN it={it}: {metrics}")
-    # Optionally save results to disk as a JSON for later analysis
-    try:
-        import json
-        ensure_dir(args.out_dir)
-        with open(os.path.join(args.out_dir, "sweep_iter_dense.json"), "w") as f:
-            json.dump(dense_results, f, indent=2)
-        with open(os.path.join(args.out_dir, "sweep_iter_crfrnn.json"), "w") as f:
-            json.dump(crf_results, f, indent=2)
-        print(f"Results saved under {args.out_dir}")
-    except Exception:
-        pass
+        crf_results[it] = metrics_val
+        print(f"  CRF-RNN it={it}: {metrics_val}")
+
+    # ------------------------------------------------------------------
+    # 3) Save JSON summaries
+    # ------------------------------------------------------------------
+    ensure_dir(args.out_dir)
+    with open(os.path.join(args.out_dir, "sweep_iter_dense.json"), "w") as f:
+        json.dump(dense_results, f, indent=2)
+    with open(os.path.join(args.out_dir, "sweep_iter_crfrnn.json"), "w") as f:
+        json.dump(crf_results, f, indent=2)
+    print(f"Results saved under {args.out_dir}")
+
 
 
 def densecrf_grid_search(args):
@@ -1264,7 +1379,7 @@ def build_argparser():
             "iteration sweep for CRF variants, or DenseCRF hyperparameter grid search."
         ),
     )
-    p.add_argument("--ckpt", type=str, default="/home/yec23006/projects/research/KOMP/PGM_project_vertebrae_segmentation/results/unet_crfrnn_best.pth", help="Path to checkpoint for evaluation")
+    p.add_argument("--ckpt", type=str, default="/home/yec23006/projects/research/KOMP/PGM_project_vertebrae_segmentation/results/unet_best.pth", help="Path to checkpoint for evaluation")
     p.add_argument("--size", type=int, default=512, help="Square resize for training & eval")
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--epochs", type=int, default=30)
